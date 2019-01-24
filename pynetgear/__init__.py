@@ -39,10 +39,6 @@ DEFAULT_USER = 'admin'
 DEFAULT_PORT = 5000
 _LOGGER = logging.getLogger(__name__)
 
-
-BLOCK = "Block"
-ALLOW = "Allow"
-
 Device = namedtuple(
     "Device", ["signal", "ip", "name", "mac", "type", "link_rate",
                "allow_or_block", "device_type", "device_model",
@@ -76,7 +72,6 @@ class Netgear(object):
         self.password = password
         self.port = port
         self.cookie = None
-        self.config_started = False
 
     def login(self):
         """
@@ -84,33 +79,28 @@ class Netgear(object):
 
         Will be called automatically by other actions.
         """
-        v1_result = self.login_v1()
-        if v1_result:
-            return v1_result
+        v2_result = self.login_v2()
+        if v2_result:
+            return v2_result
         else:
-            return self.login_v2()
+            return self.login_v1()
 
     def login_v2(self):
-        _LOGGER.debug("Login v2")
-        self.cookie = None
+        _LOGGER.info("Login v2")
 
         success, response = self._make_request(SERVICE_DEVICE_CONFIG, "SOAPLogin",
                                                {"Username": self.username, "Password": self.password},
                                                None, False)
-
         if not success:
             return None
 
         if 'Set-Cookie' in response.headers:
             self.cookie = response.headers['Set-Cookie']
-        else:
-            _LOGGER.error("Login v2 ok but no cookie...")
-            _LOGGER.debug(response.headers)
 
         return self.cookie
 
     def login_v1(self):
-        _LOGGER.debug("Login v1")
+        _LOGGER.info("Login v1")
 
         body = LOGIN_V1_BODY.format(username=self.username,
                                     password=self.password)
@@ -118,9 +108,10 @@ class Netgear(object):
         success, _ = self._make_request("ParentalControl:1", "Authenticate",
                                         None, body, False)
 
-        self.cookie = success
+        if success:
+            self.cookie = True
 
-        return success
+        return self.cookie
 
     def get_attached_devices(self):
         """
@@ -134,12 +125,10 @@ class Netgear(object):
                                                "GetAttachDevice")
 
         if not success:
-            _LOGGER.error("Get attached devices failed")
             return None
-
         success, node = _find_node(
             response.text,
-            ".//GetAttachDeviceResponse/NewAttachDevice")
+            ".//NewAttachDevice")
         if not success:
             return None
 
@@ -150,8 +139,6 @@ class Netgear(object):
                                             UNKNOWN_DEVICE_DECODED)
 
         if not decoded or decoded == "0":
-            _LOGGER.error("Can't parse attached devices string")
-            _LOGGER.debug(node.text.strip())
             return devices
 
         entries = decoded.split("@")
@@ -162,7 +149,7 @@ class Netgear(object):
             entry_count = _convert(entries.pop(0), int)
 
         if entry_count is not None and entry_count != len(entries):
-            _LOGGER.info(
+            _LOGGER.warning(
                 """Number of devices should \
                  be: %d but is: %d""", entry_count, len(entries))
 
@@ -277,64 +264,6 @@ class Netgear(object):
 
         return {t.tag: parse_text(t.text) for t in node}
 
-    def config_start(self):
-        """
-        Start a configuration session.
-        For managing router admin functionality (ie allowing/blocking devices)
-        """
-        _LOGGER.info("Config start")
-
-        success, _ = self._make_request(
-            SERVICE_DEVICE_CONFIG, "ConfigurationStarted", {"NewSessionID": SESSION_ID})
-
-        self.config_started = success
-        return success
-
-    def config_finish(self):
-        """
-        End of a configuration session.
-        Tells the router we're done managing admin functionality.
-        """
-        _LOGGER.info("Config finish")
-        if not self.config_started:
-            return True
-
-        success, _ = self._make_request(
-            SERVICE_DEVICE_CONFIG, "ConfigurationFinished", {"NewStatus": "ChangesApplied"})
-
-        self.config_started = not success
-        return success
-
-    def allow_block_device(self, mac_addr, device_status=BLOCK):
-        """
-        Allow or Block a device via its Mac Address.
-        Pass in the mac address for the device that you want to set. Pass in the
-        device_status you wish to set the device to: Allow (allow device to access the
-        network) or Block (block the device from accessing the network).
-        """
-        _LOGGER.info("Allow block device")
-        if self.config_started:
-            _LOGGER.error("Inconsistant configuration state, configuration already started")
-            return False
-
-        if not self.config_start():
-            _LOGGER.error("Could not start configuration")
-            return False
-
-        success, _ = self._make_request(
-            SERVICE_DEVICE_CONFIG, "SetBlockDeviceByMAC",
-            {"NewAllowOrBlock": device_status, "NewMACAddress": mac_addr})
-
-        if not success:
-            _LOGGER.error("Could not successfully call allow/block device")
-            return False
-
-        if not self.config_finish():
-            _LOGGER.error("Inconsistant configuration state, configuration already finished")
-            return False
-
-        return True
-
     def _get_headers(self, service, method, need_auth=True):
         headers = _get_soap_headers(service, method)
         # if the stored cookie is not a str then we are
@@ -369,28 +298,22 @@ class Netgear(object):
         message = SOAP_REQUEST.format(session_id=SESSION_ID, body=body)
 
         try:
-            response = requests.post(self.soap_url, headers=headers,
-                                     data=message, timeout=30, verify=False)
+            req = requests.post(self.soap_url, headers=headers,
+                                data=message, timeout=30, verify=False)
 
-            if need_auth and _is_unauthorized_response(response):
+            if _is_unauthorized_response(req):
                 # let's discard the cookie because it probably expired (v2)
                 # or the IP-bound (?) session expired (v1)
                 self.cookie = None
 
-                _LOGGER.warning("Unauthorized response, let's login and retry...")
+                # let's login and retry
                 if self.login():
-                    # reset headers with new cookie first
-                    headers = self._get_headers(service, method, need_auth)
-                    response = requests.post(self.soap_url, headers=headers,
-                                             data=message, timeout=30, verify=False)
+                    req = requests.post(self.soap_url, headers=headers,
+                                        data=message, timeout=30, verify=False)
+                else:
+                    return False, None
 
-            success = _is_valid_response(response)
-
-            if not success:
-                _LOGGER.error("Invalid response")
-                _LOGGER.debug("%s\n%s\n%s", response.status_code, str(response.headers), response.text)
-
-            return success, response
+            return _is_valid_response(req), req
 
         except requests.exceptions.RequestException:
             _LOGGER.exception("Error talking to API")
@@ -414,23 +337,24 @@ def autodetect_url():
                              verify=False)
             if r.status_code == 200:
                 return url
-        except requests.exceptions.RequestException:
+        except:
             pass
 
     return None
 
 
-def _find_node(text, xpath):
-    text = _illegal_xml_chars_RE.sub('', text)
-    it = ET.iterparse(StringIO(text))
+def _find_node(response, xpath):
+    response = _illegal_xml_chars_RE.sub('', response)
+    it = ET.iterparse(StringIO(response))
     # strip all namespaces
     for _, el in it:
         if '}' in el.tag:
             el.tag = el.tag.split('}', 1)[1]
+    print("=========find node")
+    print(it.root.find(xpath))
     node = it.root.find(xpath)
     if node is None:
-        _LOGGER.error("Error finding node in XML response")
-        _LOGGER.debug(text)
+        _LOGGER.error("Error finding node in response: %s", response)
         return False, None
 
     return True, node
@@ -460,8 +384,7 @@ def _get_soap_headers(service, method):
 
 def _is_valid_response(resp):
     return (resp.status_code == 200 and
-            ("<ResponseCode>0000</ResponseCode>" in resp.text or
-             "<ResponseCode>000</ResponseCode>" in resp.text))
+            "<ResponseCode>000</ResponseCode>" in resp.text)
 
 
 def _is_unauthorized_response(resp):
@@ -476,7 +399,6 @@ def _convert(value, to_type, default=None):
     except ValueError:
         # If value could not be converted
         return default
-
 
 SERVICE_PREFIX = "urn:NETGEAR-ROUTER:service:"
 SERVICE_DEVICE_INFO = "DeviceInfo:1"
