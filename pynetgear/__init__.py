@@ -350,7 +350,6 @@ def _find_node(response, xpath):
     for _, el in it:
         if '}' in el.tag:
             el.tag = el.tag.split('}', 1)[1]
-    print("=========find node")
     print(it.root.find(xpath))
     node = it.root.find(xpath)
     if node is None:
